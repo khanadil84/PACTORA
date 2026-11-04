@@ -1,4 +1,6 @@
 ﻿import hashlib
+import os
+import secrets
 import json
 import sqlite3
 import uuid
@@ -8,7 +10,7 @@ from pathlib import Path
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
 
@@ -25,6 +27,7 @@ DB_PATH = DATA_DIR / "pactora.db"
 async def lifespan(app: FastAPI):
     initialize()
     initialize_proof_tables()
+    initialize_approval_tables()
     yield
 
 
@@ -905,3 +908,201 @@ def get_reviews(commitment_id: str):
             for row in adversarial
         ]
     }
+
+
+# ============================================================
+# PACTORA HUMAN APPROVAL ENGINE
+# Separate human authorization from technical verification.
+# ============================================================
+
+def initialize_approval_tables():
+    with connect() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS approval_history (
+                id TEXT PRIMARY KEY,
+                commitment_id TEXT NOT NULL,
+                approver_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                gate_snapshot TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(commitment_id) REFERENCES commitments(id)
+            )
+        """)
+
+
+class ApprovalInput(BaseModel):
+    approver_id: str = Field(min_length=2, max_length=100)
+    decision: str = Field(min_length=6, max_length=7)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+@app.post("/commitments/{commitment_id}/approval")
+def decide_approval(
+    commitment_id: str,
+    payload: ApprovalInput,
+    approval_token: str = Header(default="", alias="X-Approval-Token")
+):
+    configured_approver = os.getenv("PACTORA_APPROVER_ID")
+    configured_token = os.getenv("PACTORA_APPROVAL_TOKEN")
+
+    if not configured_approver or not configured_token:
+        raise HTTPException(
+            503,
+            "Human approval is not configured. Set the approver ID and approval token."
+        )
+
+    if (
+        payload.approver_id != configured_approver
+        or not secrets.compare_digest(approval_token, configured_token)
+    ):
+        raise HTTPException(403, "Approver authorization failed.")
+
+    decision = payload.decision.upper()
+
+    if decision not in {"APPROVE", "REJECT"}:
+        raise HTTPException(
+            422,
+            "Decision must be APPROVE or REJECT."
+        )
+
+    with connect() as db:
+        commitment = db.execute(
+            "SELECT * FROM commitments WHERE id = ?",
+            (commitment_id,)
+        ).fetchone()
+
+        if not commitment:
+            raise HTTPException(404, "Commitment not found.")
+
+        latest_proof = db.execute(
+            """SELECT result FROM proof_evaluations
+            WHERE commitment_id = ?
+            ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (commitment_id,)
+        ).fetchone()
+
+        latest_verification = db.execute(
+            """SELECT result FROM verification_reviews
+            WHERE commitment_id = ?
+            ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (commitment_id,)
+        ).fetchone()
+
+        latest_adversarial = db.execute(
+            """SELECT result, findings FROM adversarial_reviews
+            WHERE commitment_id = ?
+            ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (commitment_id,)
+        ).fetchone()
+
+    critical_findings = []
+
+    if latest_adversarial:
+        findings = json.loads(latest_adversarial["findings"])
+        critical_findings = [
+            finding for finding in findings
+            if finding.get("severity") == "CRITICAL"
+        ]
+
+    gates = {
+        "proof_evaluation": latest_proof["result"] if latest_proof else None,
+        "independent_verification": (
+            latest_verification["result"] if latest_verification else None
+        ),
+        "adversarial_review_exists": latest_adversarial is not None,
+        "adversarial_result": (
+            latest_adversarial["result"] if latest_adversarial else None
+        ),
+        "unresolved_critical_findings": critical_findings
+    }
+
+    eligible = (
+        latest_proof is not None
+        and latest_proof["result"] == "PASS"
+        and latest_verification is not None
+        and latest_verification["result"] == "PASS"
+        and latest_adversarial is not None
+        and len(critical_findings) == 0
+    )
+
+    if decision == "APPROVE" and not eligible:
+        raise HTTPException(
+            409,
+            {
+                "message": "Approval blocked. Required technical review gates have not passed.",
+                "gates": gates
+            }
+        )
+
+    approval_id = "APR-" + uuid.uuid4().hex[:12].upper()
+    created_at = now()
+
+    with connect() as db:
+        db.execute(
+            """INSERT INTO approval_history
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                approval_id,
+                commitment_id,
+                payload.approver_id,
+                decision,
+                payload.reason,
+                json.dumps(gates),
+                created_at
+            )
+        )
+
+        db.execute(
+            "UPDATE commitments SET status = ? WHERE id = ?",
+            (
+                "APPROVED" if decision == "APPROVE" else "REJECTED",
+                commitment_id
+            )
+        )
+
+    audit(commitment_id, "HUMAN_APPROVAL_DECISION", {
+        "approval_id": approval_id,
+        "approver_id": payload.approver_id,
+        "decision": decision,
+        "reason": payload.reason,
+        "gates": gates
+    })
+
+    return {
+        "approval_id": approval_id,
+        "commitment_id": commitment_id,
+        "approver_id": payload.approver_id,
+        "decision": decision,
+        "status": "APPROVED" if decision == "APPROVE" else "REJECTED",
+        "gates": gates,
+        "created_at": created_at
+    }
+
+
+@app.get("/commitments/{commitment_id}/approval-history")
+def get_approval_history(commitment_id: str):
+    with connect() as db:
+        commitment = db.execute(
+            "SELECT id FROM commitments WHERE id = ?",
+            (commitment_id,)
+        ).fetchone()
+
+        if not commitment:
+            raise HTTPException(404, "Commitment not found.")
+
+        rows = db.execute(
+            """SELECT * FROM approval_history
+            WHERE commitment_id = ?
+            ORDER BY created_at DESC, rowid DESC""",
+            (commitment_id,)
+        ).fetchall()
+
+    return [
+        {
+            **dict(row),
+            "gate_snapshot": json.loads(row["gate_snapshot"])
+        }
+        for row in rows
+    ]
+

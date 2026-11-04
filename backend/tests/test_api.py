@@ -306,3 +306,155 @@ def test_review_history_is_persisted(client):
 
     assert response.status_code == 200
     assert len(response.json()["adversarial_reviews"]) == 1
+
+
+# PACTORA HUMAN APPROVAL ENGINE TESTS
+
+def configure_approver(monkeypatch):
+    monkeypatch.setenv("PACTORA_APPROVER_ID", "security.manager")
+    monkeypatch.setenv("PACTORA_APPROVAL_TOKEN", "test-approval-token")
+
+
+def approval_headers():
+    return {"X-Approval-Token": "test-approval-token"}
+
+
+def prepare_approval_gates(client, commitment_id):
+    evidence = attach_evidence(client, commitment_id)
+
+    checks_response = client.post(
+        f"/commitments/{commitment_id}/proof-checks",
+        json={
+            "checks": [
+                {
+                    "evidence_id": evidence["evidence_id"],
+                    "name": "Encryption setting",
+                    "operator": "contains",
+                    "expected_value": "storage_encryption=true",
+                }
+            ]
+        },
+    )
+    assert checks_response.status_code == 200
+
+    evaluation = client.post(
+        f"/commitments/{commitment_id}/evaluate"
+    )
+    assert evaluation.status_code == 200
+    assert evaluation.json()["result"] == "PASS"
+
+    verification = client.post(
+        f"/commitments/{commitment_id}/independent-review"
+    )
+    assert verification.status_code == 200
+    assert verification.json()["result"] == "PASS"
+
+    adversarial = client.post(
+        f"/commitments/{commitment_id}/adversarial-review"
+    )
+    assert adversarial.status_code == 200
+    assert adversarial.json()["result"] == "LIMITATIONS_IDENTIFIED"
+
+
+def test_approval_rejects_unauthorized_approver(client, monkeypatch):
+    configure_approver(monkeypatch)
+    commitment_id = create_commitment(client)
+
+    response = client.post(
+        f"/commitments/{commitment_id}/approval",
+        headers={"X-Approval-Token": "wrong-token"},
+        json={
+            "approver_id": "intruder",
+            "decision": "APPROVE",
+            "reason": "Unauthorized approval attempt",
+        },
+    )
+
+    assert response.status_code == 403
+
+
+def test_approval_is_blocked_when_gates_have_not_passed(client, monkeypatch):
+    configure_approver(monkeypatch)
+    commitment_id = create_commitment(client)
+
+    response = client.post(
+        f"/commitments/{commitment_id}/approval",
+        headers=approval_headers(),
+        json={
+            "approver_id": "security.manager",
+            "decision": "APPROVE",
+            "reason": "Attempt approval without completed verification",
+        },
+    )
+
+    assert response.status_code == 409
+
+
+def test_authorized_rejection_is_recorded(client, monkeypatch):
+    configure_approver(monkeypatch)
+    commitment_id = create_commitment(client)
+
+    response = client.post(
+        f"/commitments/{commitment_id}/approval",
+        headers=approval_headers(),
+        json={
+            "approver_id": "security.manager",
+            "decision": "REJECT",
+            "reason": "Evidence is insufficient for acceptance",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "REJECTED" in str(
+        client.get(f"/commitments/{commitment_id}").json()
+    )
+
+
+def test_approval_succeeds_after_all_gates_pass(client, monkeypatch):
+    configure_approver(monkeypatch)
+    commitment_id = create_commitment(client)
+
+    prepare_approval_gates(client, commitment_id)
+
+    response = client.post(
+        f"/commitments/{commitment_id}/approval",
+        headers=approval_headers(),
+        json={
+            "approver_id": "security.manager",
+            "decision": "APPROVE",
+            "reason": "All configured verification gates passed",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "APPROVED" in str(
+        client.get(f"/commitments/{commitment_id}").json()
+    )
+
+
+def test_approval_history_and_audit_are_persisted(client, monkeypatch):
+    configure_approver(monkeypatch)
+    commitment_id = create_commitment(client)
+
+    response = client.post(
+        f"/commitments/{commitment_id}/approval",
+        headers=approval_headers(),
+        json={
+            "approver_id": "security.manager",
+            "decision": "REJECT",
+            "reason": "Test persistence of approval history",
+        },
+    )
+    assert response.status_code == 200
+
+    history = client.get(
+        f"/commitments/{commitment_id}/approval-history"
+    )
+    assert history.status_code == 200
+    assert "REJECT" in str(history.json())
+
+    audit = client.get(
+        f"/commitments/{commitment_id}/audit"
+    )
+    assert audit.status_code == 200
+    assert "HUMAN_APPROVAL_DECISION" in str(audit.json())
