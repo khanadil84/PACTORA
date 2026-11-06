@@ -7,3 +7,57 @@ venv/
 backend/data/*.db
 backend/evidence/*
 !backend/evidence/.gitkeep
+runtime-demo/
+
+# Environment variables and secrets
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Databases and local application data
+*.db
+*.sqlite
+*.sqlite3
+backend/data/
+runtime-demo/
+runtime-logs/
+
+# Local evidence
+backend/evidence/*
+!backend/evidence/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+**/node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# Build and temporary files
+dist/
+build/
+*.log
+*.bak
+*.backup
+backups/
+0.26.0
+
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db
+.vscode/
+
+*.trustgraph-backup
+*.bak
+*.tsbuildinfo
+patch_review_snapshots.py
